@@ -18,8 +18,9 @@ mklink,是windows中用于快速转移文件夹或者文件的可靠的常用的
 
 你可以用Folder Relinker-mklink来转移你C盘中恼人的各种文件夹,或者管理各种webui的模型,以便节省磁盘空间.(需要注意的是windows系统文件除外).
 
-<img width="747" height="473" alt="2026-03-17-15-24" src="https://github.com/user-attachments/assets/ef4ff997-401a-4e32-9101-f5f585fcdd30" />
+<img width="747" height="473" alt="2026-03-17-15-24" src="https://github.com/user-attachments/assets/9457f9f5-1b0d-4e44-9ee5-943d298475b4" />
 
+<img width="1824" height="639" alt="3a83d855-8711-4d06-9fa1-a6be458bbfd2" src="https://github.com/user-attachments/assets/473c499c-284c-4ca2-8ba2-4b61a54d24ec" />
 
 
 
