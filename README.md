@@ -20,7 +20,6 @@ mklink,是windows中用于快速转移文件夹或者文件的可靠的常用的
 
 <img width="747" height="473" alt="2026-03-17-15-24" src="https://github.com/user-attachments/assets/ef4ff997-401a-4e32-9101-f5f585fcdd30" />
 
-<img width="1824" height="639" alt="3a83d855-8711-4d06-9fa1-a6be458bbfd2" src="https://github.com/user-attachments/assets/2a17557a-dac8-4dc0-91aa-1e17d4e104a6" />
 
 
 
