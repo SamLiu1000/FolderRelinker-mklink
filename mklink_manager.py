@@ -7,6 +7,8 @@ A graphical Windows symbolic link management tool
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import queue
+import threading
 import os
 import subprocess
 import json
@@ -212,6 +214,18 @@ class MKLinkManager:
         self.desc_d_label = ttk.Label(self.desc_frame, text=self.t("desc_d"), wraplength=350)
         self.desc_d_label.pack(anchor=tk.W, pady=2)
 
+        # Log area
+        self.log_frame = ttk.LabelFrame(self.left_frame, text="Log", padding="5")
+        self.log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        self.log_text = tk.Text(self.log_frame, height=8, wrap=tk.WORD, state=tk.DISABLED,
+                                font=("Consolas", 9))
+        log_scroll = ttk.Scrollbar(self.log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
         # Right records area (wider, 1:3 ratio)
         self.right_frame = ttk.LabelFrame(main_frame, text=self.t("records"), padding="10")
         self.right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
@@ -300,6 +314,20 @@ class MKLinkManager:
         # Refresh records to update language
         self.refresh_records()
 
+    def log(self, msg):
+        """Append a line to the log widget and auto-scroll"""
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, msg + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.root.update_idletasks()
+
+    def clear_log(self):
+        """Clear the log widget"""
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
     def browse_from(self):
         """Browse source folder"""
         path = filedialog.askdirectory(title=self.t("select_from"))
@@ -312,13 +340,198 @@ class MKLinkManager:
         if path:
             self.to_path.set(path)
 
+
+    def _copy_worker_inline(self, src, dst_full, log_queue):
+        src = os.path.abspath(src)
+        dst_full = os.path.abspath(dst_full)
+
+        dst_parent = os.path.dirname(dst_full)
+        if not os.path.exists(dst_parent):
+            try:
+                os.makedirs(dst_parent)
+            except OSError as e:
+                log_queue.put(("error", f"Cannot create destination directory: {e}"))
+                return
+
+        log_queue.put(("log", f"Scanning: {src}"))
+        total_files = 0
+        total_size = 0
+        for root, dirs, files in os.walk(src, followlinks=False):
+            for f in files:
+                fp = os.path.join(root, f)
+                if os.path.islink(fp):
+                    continue  # symlink/junction 文件跳过
+                total_files += 1
+                try:
+                    total_size += os.path.getsize(fp)
+                except OSError:
+                    pass
+
+        log_queue.put(("log", f"Total: {total_files:,} files, {total_size:,} bytes ({total_size / 1024 / 1024:.1f} MB)"))
+        log_queue.put(("log", "Copying files..."))
+
+        errors = []
+        copied_files = 0
+        copied_size = 0
+        last_progress = -1
+
+        try:
+            for root, dirs, files in os.walk(src, followlinks=False):
+                rel_path = os.path.relpath(root, src)
+                if rel_path == ".":
+                    dst_dir = dst_full
+                else:
+                    dst_dir = os.path.join(dst_full, rel_path)
+
+                if not os.path.exists(dst_dir):
+                    try:
+                        os.makedirs(dst_dir)
+                    except OSError as e:
+                        errors.append(f"Create dir failed: {rel_path}: {e}")
+                        continue
+
+                for f in files:
+                    src_file = os.path.join(root, f)
+                    dst_file = os.path.join(dst_dir, f)
+                    try:
+                        # 跳过 symlink/junction 文件，避免因链接损坏导致复制失败
+                        if os.path.islink(src_file):
+                            log_queue.put(("log", f"  Skip symlink: {os.path.join(rel_path, f)}"))
+                            continue
+                        shutil.copy2(src_file, dst_file)
+                        copied_files += 1
+                        try:
+                            copied_size += os.path.getsize(dst_file)
+                        except OSError:
+                            pass
+                    except Exception as e:
+                        errors.append(f"{os.path.join(rel_path, f)}: {e}")
+
+                    if total_files > 0:
+                        progress = int(copied_files * 100 / total_files)
+                        if progress >= last_progress + 5:
+                            log_queue.put(("log", f"  Progress: {copied_files:,}/{total_files:,} files ({progress}%)"))
+                            last_progress = progress
+
+            log_queue.put(("log", f"Copy done: {copied_files:,}/{total_files:,} files, {copied_size:,} bytes ({copied_size / 1024 / 1024:.1f} MB)"))
+
+            if errors:
+                log_queue.put(("log", f"WARNING: {len(errors)} files failed to copy:"))
+                for err in errors[:30]:
+                    log_queue.put(("log", f"  FAIL: {err}"))
+                if len(errors) > 30:
+                    log_queue.put(("log", f"  ... and {len(errors) - 30} more errors"))
+                log_queue.put(("result", (False, f"Copied {copied_files}/{total_files} files. {len(errors)} failed.")))
+            else:
+                log_queue.put(("result", (True, None)))
+
+        except Exception as e:
+            log_queue.put(("log", f"Copy exception: {e}"))
+            log_queue.put(("result", (False, str(e))))
+
+    def _count_files_and_size_inline(self, path):
+        file_count = 0
+        total_size = 0
+        try:
+            for root, dirs, files in os.walk(path, followlinks=False):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if os.path.islink(fp):
+                        continue  # symlink/junction 不计入，与复制行为一致
+                    file_count += 1
+                    try:
+                        total_size += os.path.getsize(fp)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return file_count, total_size
+
+    def _poll_transfer_queue(self, log_queue, transfer_thread, from_path, to_full, link_type):
+        try:
+            while True:
+                msg = log_queue.get_nowait()
+                msg_type, data = msg
+
+                if msg_type == "log":
+                    self.log(data)
+                elif msg_type == "copy_failed":
+                    self.log(f"Copy FAILED: {data}")
+                    messagebox.showerror("Error", f"Copy failed:\n{data}")
+                    self._finish_transfer()
+                    return
+                elif msg_type == "verify_failed":
+                    msg = "Copy verification failed!\n" + data + "\n\nTransfer aborted - source has NOT been deleted."
+                    messagebox.showerror("Verification Failed", msg)
+                    self._finish_transfer()
+                    return
+                elif msg_type == "done":
+                    record = {
+                        "type": link_type,
+                        "from": from_path,
+                        "to": to_full,
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    self.records.append(record)
+                    self.save_records()
+                    self.refresh_records()
+                    messagebox.showinfo("Success", self.t("success").format(link_type, from_path, to_full))
+                    self.from_path.set("")
+                    self.to_path.set("")
+                    self._finish_transfer()
+                    return
+                elif msg_type == "link_failed":
+                    messagebox.showerror("Error",
+                        self.t("error_link") + f"\n{data}" +
+                        f"\n\nSource folder has been deleted. The copied data is at:\n{to_full}" +
+                        f"\nYou may need to manually create the link or move the data back.")
+                    self._finish_transfer()
+                    return
+        except queue.Empty:
+            pass
+
+        if transfer_thread.is_alive():
+            self.root.after(100, self._poll_transfer_queue, log_queue, transfer_thread, from_path, to_full, link_type)
+        else:
+            self._finish_transfer()
+
+    def _finish_transfer(self):
+        self.transfer_btn.config(state="normal")
+        self.root.config(cursor="")
+
+    def copy_folder_with_dialog(self, src, dst_full):
+        pass
+
+    def verify_copy(self, src, dst):
+        src_info = self._count_files_and_size(src)
+        dst_info = self._count_files_and_size(dst)
+
+        if src_info == dst_info:
+            return True, f"Verified: {src_info[0]} files, {src_info[1]:,} bytes"
+
+        details = f"Mismatch! Source: {src_info[0]} files / {src_info[1]:,} bytes, Target: {dst_info[0]} files / {dst_info[1]:,} bytes"
+        return False, details
+
+    def _count_files_and_size(self, path):
+        file_count = 0
+        total_size = 0
+        try:
+            for root, dirs, files in os.walk(path, followlinks=False):
+                file_count += len(files)
+                for f in files:
+                    try:
+                        total_size += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return file_count, total_size
+
     def execute_transfer(self):
-        """Execute transfer operation"""
         from_path = self.from_path.get()
         to_path = self.to_path.get()
         link_type = self.link_type.get()
 
-        # Validate input
         if not from_path:
             messagebox.showerror("Error", self.t("error_from"))
             return
@@ -331,56 +544,165 @@ class MKLinkManager:
             messagebox.showerror("Error", self.t("error_from_exist"))
             return
 
-        # Get source name
         from_name = os.path.basename(from_path)
         to_full = os.path.join(to_path, from_name)
 
-        # Check if target already exists
         if os.path.exists(to_full):
             messagebox.showerror("Error", self.t("error_to_exist") + f"\n{to_full}")
             return
 
+        self.transfer_btn.config(state="disabled")
+        self.root.config(cursor="watch")
+        self.clear_log()
+        self.log(f"{'='*60}")
+        self.log(f"Transfer started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.log(f"Source:  {from_path}")
+        self.log(f"Target:  {to_full}")
+        self.log(f"Link type: {link_type}")
+        self.log(f"{'='*60}")
+        self.root.update()
+
+        log_queue = queue.Queue()
+        transfer_thread = threading.Thread(
+            target=self._transfer_worker,
+            args=(from_path, to_full, link_type, log_queue),
+            daemon=True
+        )
+        transfer_thread.start()
+        self.root.after(100, self._poll_transfer_queue, log_queue, transfer_thread, from_path, to_full, link_type)
+
+    def _transfer_worker(self, from_path, to_full, link_type, log_queue):
+        from_path = os.path.abspath(from_path)
+        to_full = os.path.abspath(to_full)
+
+        # Step 1: Copy
+        log_queue.put(("log", "--- Step 1: Copy ---"))
+        self._copy_worker_inline(from_path, to_full, log_queue)
+
+        # Drain queue to get the copy result
+        copy_ok = False
+        copy_error = None
+        pending = []
+        while True:
+            try:
+                msg = log_queue.get_nowait()
+                if msg[0] == "result":
+                    copy_ok, copy_error = msg[1]
+                elif msg[0] == "log":
+                    pending.append(msg)
+                elif msg[0] == "error":
+                    copy_ok = False
+                    copy_error = msg[1]
+            except queue.Empty:
+                break
+
+        # Re-queue pending log messages
+        for p in pending:
+            log_queue.put(p)
+
+        if not copy_ok:
+            self._cleanup_target(to_full, log_queue)
+            log_queue.put(("copy_failed", copy_error))
+            return
+
+        # Step 2: Rename source, then create mklink
+        log_queue.put(("log", "--- Step 2: Create mklink ---"))
+        from_name = os.path.basename(from_path)
+        from_parent = os.path.dirname(from_path)
+        temp_path = os.path.join(from_parent, from_name + "_relink_tmp")
+
+        # Rename source folder to temporary name
         try:
-            # First move source folder to target location
-            shutil.move(from_path, to_full)
-
-            # Create symbolic link (at original location, pointing to new location)
-            # mklink command format: mklink [option] link_location target_location
-            if link_type == "/D":
-                cmd = f'mklink /D "{from_path}" "{to_full}"'
-            else:  # /J
-                cmd = f'mklink /J "{from_path}" "{to_full}"'
-
-            # Execute mklink command (requires admin privileges)
-            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-
-            if result.returncode == 0:
-                # Add record
-                record = {
-                    "type": link_type,
-                    "from": from_path,
-                    "to": to_full,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                self.records.append(record)
-                self.save_records()
-                self.refresh_records()
-
-                messagebox.showinfo("Success", self.t("success").format(link_type, from_path, to_full))
-
-                # Clear input
-                self.from_path.set("")
-                self.to_path.set("")
-            else:
-                # If link creation failed, try to restore file to original location
-                try:
-                    shutil.move(to_full, from_path)
-                except:
-                    pass
-                messagebox.showerror("Error", self.t("error_link") + f"\n{result.stderr}")
-
+            os.rename(from_path, temp_path)
+            log_queue.put(("log", f"Source renamed to: {temp_path}"))
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            log_queue.put(("log", f"Rename source FAILED: {e}"))
+            self._cleanup_target(to_full, log_queue)
+            log_queue.put(("copy_failed", f"Failed to rename source folder: {e}"))
+            return
+
+        # Create mklink at original source position
+        if link_type == "/D":
+            cmd = f'mklink /D "{from_path}" "{to_full}"'
+        else:
+            cmd = f'mklink /J "{from_path}" "{to_full}"'
+
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+
+        if result.returncode != 0:
+            log_queue.put(("log", f"Link creation FAILED: {result.stderr}"))
+            # Restore source folder from temp
+            try:
+                os.rename(temp_path, from_path)
+                log_queue.put(("log", "Source restored from temp"))
+            except:
+                log_queue.put(("log", "CRITICAL: Failed to restore source from temp!"))
+            self._cleanup_target(to_full, log_queue)
+            log_queue.put(("link_failed", result.stderr))
+            return
+
+        log_queue.put(("log", f"Link created: {from_path} -> {to_full}"))
+
+        # Step 3: Verify (via the newly created link)
+        log_queue.put(("log", "--- Step 3: Verify ---"))
+        src_info = self._count_files_and_size_inline(from_path)
+        dst_info = self._count_files_and_size_inline(to_full)
+
+        if src_info == dst_info:
+            log_queue.put(("log", f"Verification PASSED: {src_info[0]} files, {src_info[1]:,} bytes"))
+        else:
+            details = f"Mismatch! Source: {src_info[0]} files / {src_info[1]:,} bytes, Target: {dst_info[0]} files / {dst_info[1]:,} bytes"
+            log_queue.put(("log", f"Verification FAILED: {details}"))
+            # Remove the mklink
+            try:
+                subprocess.run(f'rmdir "{from_path}"', shell=True, capture_output=True, text=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+                log_queue.put(("log", "Removed failed link"))
+            except:
+                log_queue.put(("log", "Failed to remove link"))
+            # Restore source from temp
+            try:
+                os.rename(temp_path, from_path)
+                log_queue.put(("log", "Source restored from temp"))
+            except:
+                log_queue.put(("log", "CRITICAL: Failed to restore source from temp!"))
+            self._cleanup_target(to_full, log_queue)
+            log_queue.put(("verify_failed", details))
+            return
+
+        # Step 4: Delete original source (now at temp location)
+        log_queue.put(("log", "--- Step 4: Delete original source ---"))
+        try:
+            subprocess.run(f'rmdir /S /Q "{temp_path}"', shell=True, capture_output=True, text=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            log_queue.put(("log", "Original source deleted"))
+        except:
+            log_queue.put(("log", "Delete source failed (non-fatal)"))
+
+        log_queue.put(("done", None))
+
+    def _cleanup_target(self, target_path, log_queue):
+        """清理已复制但无效的目标文件夹"""
+        if os.path.exists(target_path):
+            log_queue.put(("log", "Cleaning up incomplete target..."))
+            try:
+                # 第一次尝试：rmdir /S /Q
+                subprocess.run(f'rmdir /S /Q "{target_path}"', shell=True, capture_output=True, text=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+                # 检查是否还残留
+                if os.path.exists(target_path):
+                    # 可能部分文件被锁定，重试一次
+                    import time
+                    time.sleep(0.5)
+                    subprocess.run(f'rmdir /S /Q "{target_path}"', shell=True, capture_output=True, text=True,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+
+                if os.path.exists(target_path):
+                    log_queue.put(("log", "WARNING: Target not fully cleaned, some files may be locked"))
+                else:
+                    log_queue.put(("log", "Target cleaned up"))
+            except Exception as e:
+                log_queue.put(("log", f"Cleanup warning: {e}"))
 
     def get_link_target(self, path):
         """Get the target of a symbolic link or junction"""
